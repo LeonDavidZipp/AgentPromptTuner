@@ -1,0 +1,27 @@
+[project]
+name = "llm-prompt-tuner"
+version = "0.1.0"
+description = "A small & open source tool to search for the best llms & prompts."
+readme = "README.md"
+authors = [
+    { name = "Leon David Zipp", email = "leondavidzipp@proton.me" }
+]
+license = "MIT"
+license-files = ["LICEN[CS]E*"]
+requires-python = ">=3.12"
+dependencies = [
+    "langchain>=0.3.25",
+    "pydantic>=2.11.5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/data_science_lib"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "hatchling>=1.27.0",
+]
