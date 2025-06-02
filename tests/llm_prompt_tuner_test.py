@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel
 import unittest
 
+
 class LLMPromptTesterTest(unittest.IsolatedAsyncioTestCase):
 	def setUp(self):
 		"""Set up the LLMPromptTester instance for testing."""
@@ -14,12 +15,14 @@ class LLMPromptTesterTest(unittest.IsolatedAsyncioTestCase):
 			prompt_improvement_prompt=None,
 			improvement_retries=None,
 			validation_llm=None,
-			validation_prompt=None
+			validation_prompt=None,
 		)
 
 	async def test_arun_structured(self):
 		"""Test the arun_structured method of LLMPromptTester."""
-		structured_llms: list[Runnable[LanguageModelInput, dict[str, Any] | BaseModel]] = []
+		structured_llms: list[
+			Runnable[LanguageModelInput, dict[str, Any] | BaseModel]
+		] = []
 		prompts: list[ChatPromptTemplate] = []
 		tests: list[Test] = []
 
