@@ -6,6 +6,7 @@ from typing import Any, Annotated, Literal
 from pydantic import BaseModel
 from enum import IntEnum
 import numpy as np
+from numpy.typing import NDArray
 import asyncio
 import itertools
 import warnings
@@ -92,7 +93,7 @@ class TuneResult(BaseModel):
 	]
 	prompt: Annotated[ChatPromptTemplate, "Index of the prompt in the list of prompts"]
 	individual_scores: Annotated[
-		dict[int, float], "Scores for each individual tuning run, between 0 and 1"
+		NDArray[np.float128], "Scores for each individual tuning run, between 0 and 1"
 	]
 	target_score: Annotated[
 		float, "Overall target score for the best model-prompt combination"
@@ -264,30 +265,14 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 			dtype=float,
 		)
 
-		match self.target:
-			case "median_score":
-				target_score = float(np.median(scores))
-			case "mean_score":
-				target_score = scores.mean()
-			case "best_case":
-				target_score = scores.max()
-			case "worst_case":
-				target_score = scores.min()
-			case "cost_per_value":
-				if cost_per_value_scores.size == 0:
-					raise ValueError(
-						"No valid cost per value scores found for the target 'cost_per_value'."
-					)
-				target_score = np.min(cost_per_value_scores)
-			case _:
-				raise ValueError(f"Unsupported target: {self.target}")
+		target_score: float = self.calc_target_score_(scores, cost_per_value_scores)
 
 		return TuneResult(
 			model=llm,
 			prompt=ChatPromptTemplate.from_messages(  # type: ignore[arg-type]
 				[("system", prompt)]
 			),
-			individual_scores={i: result.score for i, result in enumerate(results)},
+			individual_scores=scores,
 			target_score=target_score,
 		)
 
@@ -370,3 +355,47 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 		# self.prompt_improvement_llm.invoke()
 
 		raise NotImplementedError("unimplemented")
+
+	def calc_target_score_(
+		self, scores: NDArray[np.float128], cost_per_value_scores: NDArray[np.float128]
+	) -> float:
+		"""
+		Calculates the overall score from individual results.
+
+		Args:
+			results (list[SingleTuneResult]): List of individual tuning results.
+
+		Returns:
+			TuneResult: The overall tuning result.
+		"""
+
+		match self.target:
+			case "median_score":
+				return float(np.median(scores))
+			case "mean_score":
+				return scores.mean()
+			case "best_case":
+				return scores.max()
+			case "worst_case":
+				return scores.min()
+			case "cost_per_value":
+				if cost_per_value_scores.size == 0:
+					raise ValueError(
+						"No valid cost per value scores found for the target 'cost_per_value'."
+					)
+				return self.calc_cost_per_value_score_(cost_per_value_scores)
+			case _:
+				raise ValueError(f"Unsupported target: {self.target}")
+
+	# TODO: implement cost calculation logic, this is a placeholder
+	def calc_cost_per_value_score_(self, scores: NDArray[np.float128]) -> float:
+		"""
+		Calculates the cost per correct value score from individual results.
+
+		Args:
+			scores (NDArray[np.float128]): Array of individual scores.
+
+		Returns:
+			float | None: The cost per correct value score, or None if not applicable.
+		"""
+		return scores.mean()
