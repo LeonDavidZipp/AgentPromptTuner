@@ -215,30 +215,33 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 			temperature,
 			prompts,
 		)
-		tasks: list[TuneResult] = []
-		# TODO: add support for repetitions and temperature variations
-		# for every scenario
+		# tasks: list[TuneResult] = []
+		# TODO: add support for repetitions and temperature variations for every scenario
 		async with asyncio.TaskGroup() as tg:
-			for scenario, llm, temp, prompt in combinations:
-				new_llm = llm.with_config(temperature=temp) if temp else llm
-				tasks.append(
-					tg.create_task(self.atune_scenario(scenario, new_llm, prompt))
+			tasks: list[asyncio.Task[TuneResult]] = [
+				tg.create_task(
+					coro=self.atune_scenario(
+						scenario,
+						llm.with_config(temperature=temp) if temp else llm,
+						prompt,
+					)
 				)
-			return result
+				for scenario, llm, temp, prompt in combinations
+			]
+		results: list[TuneResult] = [task.result() for task in tasks]
 
 	async def atune_scenario(
 		self,
 		scenario: Scenario,
 		llm: Runnable[LanguageModelInput, dict[str, Any] | BaseModel],
 		prompt: str,
-		repeat: int,
 	) -> TuneResult:
 		async with asyncio.TaskGroup() as tg:
 			tasks: list[asyncio.Task[SingleTuneResult]] = [
 				tg.create_task(
 					coro=self.ascore_single_scenario(scenario, llm, prompt), name=str(i)
 				)
-				for i in range(repeat)
+				for i in range(self.repeat)
 			]
 		results: list[SingleTuneResult] = [task.result() for task in tasks]
 		scores = np.array(
