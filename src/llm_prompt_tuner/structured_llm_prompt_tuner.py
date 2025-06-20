@@ -2,7 +2,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
 from langchain_core.language_models.base import LanguageModelInput
-from typing import Any, Annotated, Literal
+from typing import Any, Literal
 from pydantic import BaseModel
 from enum import IntEnum
 import numpy as np
@@ -27,8 +27,8 @@ class ImprovePromptOutput(BaseModel):
 	- suggestion: Optional suggestion for further improvements.
 	"""
 
-	improved_prompt: Annotated[str, "The improved prompt"]
-	suggestion: Annotated[str | None, "Optional suggestion for further improvements"]
+	improved_prompt: str
+	suggestion: str | None
 
 
 class Scenario(BaseModel):
@@ -38,40 +38,48 @@ class Scenario(BaseModel):
 	- expected_output: the expected output to compare against
 	"""
 
-	input: Annotated[dict[str, Any], "Input data for the scenario, can be any type"]
-	expected_output: Annotated[Any, "Expected structured output for this scenario"]
+	input: dict[str, Any]
+	expected_output: Any
+
+def make_scenarios(inputs: list[tuple[dict[str, Any], Any]]) -> list[Scenario]:
+	"""
+	Utility function to create a list of scenarios from a list of input-output pairs.
+
+	Args:
+		inputs (list[tuple[dict[str, Any], Any]]): List of tuples containing input and expected output.
+
+	Returns:
+		list[Scenario]: List of Scenario objects created from the input-output pairs.
+	"""
+
+	return [
+		Scenario(input=input_data, expected_output=expected_output)
+		for input_data, expected_output in inputs
+	]
 
 
 class TuneInput(BaseModel):
 	"""
-	A tune input contains all input rparameters for a single model-prompt-scenario combination
+	A tune input contains all input parameters for a single model-prompt-scenario combination
 	- model: the model to try
 	- prompt: the prompt to pass to the model
 	- scenario: the scenario to run the model-prompt-combination against
 	"""
 
-	model: Annotated[
-		Runnable[LanguageModelInput, dict[str, Any] | BaseModel],
-		"The model in the list of structured_llms",
-	]
-	prompt: Annotated[ChatPromptTemplate, "The prompt"]
-	scenario: Annotated[Scenario, "The scenario to fit the combination to."]
+	model: Runnable[LanguageModelInput, dict[str, Any] | BaseModel]
+	prompt: ChatPromptTemplate
+	scenario: Scenario
 
 
 class SingleTuneResult(BaseModel):
 	"""
-	A single tune result contains the model-prompt-combination along with the accuracy-score and cost-per-value-score
-	- accuracy_score: the score of the model-prompt-combination, between 0 and 1
-	- cost_per_value_score: the cost per correct value for the scenario, None if not applicable
+	A single tune result contains the score of a single model-prompt-scenario combination and the state of the tuning run.
+	- target_score: the score of the model-prompt-combination, between 0 and 1 if "median_score", "mean_score", "best_case", "worst_case" or >= 0 if "cost_per_value"
+	- state: the state of the tuning run, e.g. SUCCESS or FAILURE
 	"""
 
-	score: Annotated[
-		float, "Score of the model-prompt(-temperature)-combination, between 0 and 1"
-	]
-	cost_per_value_score: Annotated[
-		float | None, "Cost per correct value for the scenario. None if not applicable"
-	]
-	state: Annotated[TuneOutcome, "State of the tuning run, e.g. SUCCESS or FAILURE"]
+	target_score: float
+	state: TuneOutcome
 
 
 class TuneResult(BaseModel):
@@ -80,24 +88,13 @@ class TuneResult(BaseModel):
 	- model: the model that was used
 	- prompt: the prompt that was used
 	- individual_scores: the scores for each individual tuning run, between 0 and 1
-	- median_score: the median score of all iterations
-	- mean_score: the mean score of all iterations
-	- best_score: the best score of all iterations
-	- worst_score: the worst score of all iterations
-	- average_cost_per_value: the best cost per correct value for all individual tuning runs. None if not applicable
+	- target_score: the overall score of the model-prompt-combination, between 0 and 1 if "median_score", "mean_score", "best_case", "worst_case" or >= 0 if "cost_per_value"
 	"""
 
-	model: Annotated[
-		Runnable[LanguageModelInput, dict[str, Any] | BaseModel],
-		"Index of the model in the list of structured_llms",
-	]
-	prompt: Annotated[ChatPromptTemplate, "Index of the prompt in the list of prompts"]
-	individual_scores: Annotated[
-		NDArray[np.float128], "Scores for each individual tuning run, between 0 and 1"
-	]
-	target_score: Annotated[
-		float, "Overall target score for the best model-prompt combination"
-	]
+	model: Runnable[LanguageModelInput, dict[str, Any] | BaseModel]
+	prompt: ChatPromptTemplate
+	individual_scores: NDArray[np.float128]
+	target_score: float
 
 
 class BaseLLMPromptTuner:
@@ -149,11 +146,12 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 		self.prompt_improvement_llm = prompt_improvement_llm
 		self.prompt_improvement_prompt = initial_prompt_improvement_prompt
 		self.improvement_retries = improvement_retries
+		# TODO: add logging
 
 	def find(
 		self,
 		structured_llms: list[Runnable[LanguageModelInput, dict[str, Any] | BaseModel]],
-		prompts: list[ChatPromptTemplate],
+		prompts: list[str],
 		temperature: int | float | list[float | float],
 		scenario: list[Scenario],
 	) -> TuneResult:
@@ -185,7 +183,7 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 		Args:
 			structured_llms (list[Runnable[LanguageModelInput, dict[str, Any] | BaseModel]]):
 				List of structured LLMs to test.
-			prompts (list[ChatPromptTemplate]): List of prompts to use for testing.
+			prompts (list[str]): List of prompts to use for testing.
 			scenario (list[Scenario]): List of scenario to run, each containing input and expected output.
 
 		Returns:
@@ -211,12 +209,8 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 			)
 
 		combinations = itertools.product(
-			scenarios,
-			structured_llms,
-			temperature,
-			prompts,
+			scenarios, structured_llms, temperature, prompts
 		)
-		# tasks: list[TuneResult] = []
 		# TODO: add support for repetitions and temperature variations for every scenario
 		async with asyncio.TaskGroup() as tg:
 			tasks: list[asyncio.Task[TuneResult]] = [
@@ -230,6 +224,11 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 				for scenario, llm, temp, prompt in combinations
 			]
 		results: list[TuneResult] = [task.result() for task in tasks]
+		scores = np.array(
+			[result.target_score for result in results],
+			dtype=float,
+		)
+		target_score: float = self.calc_target_score_(scores)
 
 	async def atune_scenario(
 		self,
@@ -237,6 +236,15 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 		llm: Runnable[LanguageModelInput, dict[str, Any] | BaseModel],
 		prompt: str,
 	) -> TuneResult:
+		"""
+		Tunes a single scenario using the provided LLM and prompt for self.repeat times.
+
+		Args:
+			scenario (Scenario): The scenario to tune, containing input and expected output.
+			llm (Runnable[LanguageModelInput, dict[str, Any] | BaseModel]):
+				The LLM to use for tuning the scenario.
+			prompt (str): The prompt to use for the LLM.
+		"""
 		async with asyncio.TaskGroup() as tg:
 			tasks: list[asyncio.Task[SingleTuneResult]] = [
 				tg.create_task(
@@ -246,26 +254,15 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 			]
 		results: list[SingleTuneResult] = [task.result() for task in tasks]
 		scores = np.array(
-			[result.score for result in results if result.state == TuneOutcome.SUCCESS],
+			[result.target_score for result in results if result.state == TuneOutcome.SUCCESS],
 			dtype=float,
 		)
 		if scores.size == 0:
 			raise ValueError(
 				"No successful tuning runs found. All runs failed or had zero fields."
 			)
-		cost_per_value_scores = np.array(
-			[
-				result.cost_per_value_score
-				for result in results
-				if (
-					result.cost_per_value_score is not None
-					and result.state == TuneOutcome.SUCCESS
-				)
-			],
-			dtype=float,
-		)
 
-		target_score: float = self.calc_target_score_(scores, cost_per_value_scores)
+		target_score: float = self.calc_target_score_(scores)
 
 		return TuneResult(
 			model=llm,
@@ -329,16 +326,13 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 				UserWarning,
 			)
 			return SingleTuneResult(
-				score=0.0,
-				cost_per_value_score=None,
+				target_score=0.0,
 				state=TuneOutcome.ZERO_FIELDS_FAILURE,
 			)
 
 		# TODO: implement cost calculation logic, this is a placeholder
-		cost_per_value_score = None
 		return SingleTuneResult(
-			score=correct / total,
-			cost_per_value_score=cost_per_value_score,
+			target_score=correct / total,
 			state=TuneOutcome.SUCCESS,
 		)
 
@@ -357,7 +351,7 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 		raise NotImplementedError("unimplemented")
 
 	def calc_target_score_(
-		self, scores: NDArray[np.float128], cost_per_value_scores: NDArray[np.float128]
+		self, scores: NDArray[np.float128]
 	) -> float:
 		"""
 		Calculates the overall score from individual results.
@@ -379,11 +373,7 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 			case "worst_case":
 				return scores.min()
 			case "cost_per_value":
-				if cost_per_value_scores.size == 0:
-					raise ValueError(
-						"No valid cost per value scores found for the target 'cost_per_value'."
-					)
-				return self.calc_cost_per_value_score_(cost_per_value_scores)
+				return self.calc_cost_per_value_score_(scores)
 			case _:
 				raise ValueError(f"Unsupported target: {self.target}")
 
