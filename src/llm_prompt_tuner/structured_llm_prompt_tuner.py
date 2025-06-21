@@ -2,8 +2,9 @@ from langchain_core.language_models import BaseChatModel
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
 from langchain_core.language_models.base import LanguageModelInput
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 from pydantic import BaseModel
+from collections import defaultdict
 from enum import IntEnum
 import numpy as np
 from numpy.typing import NDArray
@@ -40,6 +41,7 @@ class Scenario(BaseModel):
 
 	input: dict[str, Any]
 	expected_output: Any
+
 
 def make_scenarios(inputs: list[tuple[dict[str, Any], Any]]) -> list[Scenario]:
 	"""
@@ -82,9 +84,22 @@ class SingleTuneResult(BaseModel):
 	state: TuneOutcome
 
 
+class IntermediateTuneResult(BaseModel):
+	"""
+	An intermediate tune result contains a model-prompt-combination along with the scores.
+	- model: the model that was used
+	- prompt: the prompt that was used
+	- individual_scores: the scores for each individual tuning run, between 0 and 1
+	"""
+
+	model: Runnable[LanguageModelInput, dict[str, Any] | BaseModel]
+	prompt: str
+	individual_scores: NDArray[np.float128]
+
+
 class TuneResult(BaseModel):
 	"""
-	A tune result contains the overall best model-prompt-combination along with the scores. Used for both single scenario & overall tuning.
+	A tune result contains the overall best model-prompt-combination along with the scores.
 	- model: the model that was used
 	- prompt: the prompt that was used
 	- individual_scores: the scores for each individual tuning run, between 0 and 1
@@ -92,9 +107,21 @@ class TuneResult(BaseModel):
 	"""
 
 	model: Runnable[LanguageModelInput, dict[str, Any] | BaseModel]
-	prompt: ChatPromptTemplate
+	prompt: str
 	individual_scores: NDArray[np.float128]
 	target_score: float
+
+
+# Type for the key tuple
+CombinationKey: TypeAlias = tuple[int, str, float]
+
+# Type for individual combination data
+CombinationData: TypeAlias = tuple[
+	Runnable[LanguageModelInput, dict[str, Any] | BaseModel],
+	str,
+	float,
+	Scenario,
+]
 
 
 class BaseLLMPromptTuner:
@@ -189,6 +216,11 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 		Returns:
 			list[SingleTuneResult]: List of test results, each containing model index, prompt index,
 				individual scores, overall score, and optional improvement suggestion.
+
+		Raises:
+			ValueError: If temperature is not a float, int, or list of floats/ints between 0 and 1 inclusive.
+			TypeError: If temperature is not a float, int, or list of floats/ints.
+			ValueError: If no successful tuning runs are found (all runs failed or had zero fields).
 		"""
 
 		if isinstance(temperature, int):
@@ -209,33 +241,60 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 			)
 
 		combinations = itertools.product(
-			scenarios, structured_llms, temperature, prompts
+			structured_llms, prompts, temperature, scenarios
 		)
-		# TODO: add support for repetitions and temperature variations for every scenario
+		grouped_combinations: dict[CombinationKey, list[CombinationData]] = defaultdict(
+			list
+		)
+		for llm, prompt, temp, scenario in combinations:
+			grouped_combinations[(id(llm), prompt, temp)].append(
+				(llm, prompt, temp, scenario)
+			)
+
+		# Create tasks grouped by combination
+		grouped_tasks: dict[
+			CombinationKey, list[asyncio.Task[IntermediateTuneResult]]
+		] = {}
 		async with asyncio.TaskGroup() as tg:
-			tasks: list[asyncio.Task[TuneResult]] = [
-				tg.create_task(
-					coro=self.atune_scenario(
-						scenario,
-						llm.with_config(temperature=temp) if temp else llm,
-						prompt,
+			for key, combo_list in grouped_combinations.items():
+				tasks_for_combo = [
+					tg.create_task(
+						self.atune_scenario(
+							scenario,
+							llm.with_config(temperature=temp) if temp else llm,
+							prompt,
+						)
 					)
+					for llm, prompt, temp, scenario in combo_list
+				]
+				grouped_tasks[key] = tasks_for_combo
+
+		# Collect results grouped by combination
+		grouped_results: dict[CombinationKey, list[IntermediateTuneResult]] = {}
+		for key, tasks in grouped_tasks.items():
+			grouped_results[key] = [task.result() for task in tasks]
+
+		results: list[TuneResult] = []
+		for key, val in grouped_results.items():
+			individual_scores = np.concatenate([v.individual_scores for v in val])
+			target_score = self.calc_target_score_(individual_scores)
+			results.append(
+				TuneResult(
+					model=val[0].model,
+					prompt=key[1],
+					individual_scores=individual_scores,
+					target_score=target_score,
 				)
-				for scenario, llm, temp, prompt in combinations
-			]
-		results: list[TuneResult] = [task.result() for task in tasks]
-		scores = np.array(
-			[result.target_score for result in results],
-			dtype=float,
-		)
-		target_score: float = self.calc_target_score_(scores)
+			)
+
+		return self.find_best_(results)
 
 	async def atune_scenario(
 		self,
 		scenario: Scenario,
 		llm: Runnable[LanguageModelInput, dict[str, Any] | BaseModel],
 		prompt: str,
-	) -> TuneResult:
+	) -> IntermediateTuneResult:
 		"""
 		Tunes a single scenario using the provided LLM and prompt for self.repeat times.
 
@@ -244,7 +303,14 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 			llm (Runnable[LanguageModelInput, dict[str, Any] | BaseModel]):
 				The LLM to use for tuning the scenario.
 			prompt (str): The prompt to use for the LLM.
+
+		Returns:
+			IntermediateTuneResult: The result of the tuning, containing the model, prompt, and individual scores.
+
+		Raises:
+			ValueError: If no successful tuning runs are found (all runs failed or had zero fields).
 		"""
+
 		async with asyncio.TaskGroup() as tg:
 			tasks: list[asyncio.Task[SingleTuneResult]] = [
 				tg.create_task(
@@ -254,7 +320,11 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 			]
 		results: list[SingleTuneResult] = [task.result() for task in tasks]
 		scores = np.array(
-			[result.target_score for result in results if result.state == TuneOutcome.SUCCESS],
+			[
+				result.target_score
+				for result in results
+				if result.state == TuneOutcome.SUCCESS
+			],
 			dtype=float,
 		)
 		if scores.size == 0:
@@ -262,15 +332,10 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 				"No successful tuning runs found. All runs failed or had zero fields."
 			)
 
-		target_score: float = self.calc_target_score_(scores)
-
-		return TuneResult(
+		return IntermediateTuneResult(
 			model=llm,
-			prompt=ChatPromptTemplate.from_messages(  # type: ignore[arg-type]
-				[("system", prompt)]
-			),
+			prompt=prompt,
 			individual_scores=scores,
-			target_score=target_score,
 		)
 
 	async def ascore_single_scenario(
@@ -289,7 +354,12 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 
 		Returns:
 			SingleTuneResult: The result of the scoring, containing the score and cost per value score.
+
+		Raises:
+			ValueError: If the output type does not match the expected output type.
+			UserWarning: If no comparable fields are found in the output and expected output.
 		"""
+
 		# retrieve output and expected output to compare against
 		formatted_prompt = ChatPromptTemplate.from_messages(  # type: ignore[arg-type]
 			[("system", prompt)]
@@ -350,9 +420,7 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 
 		raise NotImplementedError("unimplemented")
 
-	def calc_target_score_(
-		self, scores: NDArray[np.float128]
-	) -> float:
+	def calc_target_score_(self, scores: NDArray[np.float128]) -> float:
 		"""
 		Calculates the overall score from individual results.
 
@@ -388,4 +456,28 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 		Returns:
 			float | None: The cost per correct value score, or None if not applicable.
 		"""
+
 		return scores.mean()
+
+	def find_best_(self, results: list[TuneResult]) -> TuneResult:
+		"""
+		Finds the best model-prompt(-temperature) combination based on the target metric.
+		Args:
+			results (list[TuneResult]): List of tuning results to evaluate.
+		Returns:
+			TuneResult: The best tuning result based on the target metric.
+		Raises:
+			UserWarning: If the results are empty.
+			ValueError: If the target is unsupported.
+		"""
+		if not results:
+			raise ValueError(
+				"No results found. Ensure that the tuning process was successful."
+			)
+		match self.target:
+			case "median_score" | "mean_score" | "best_case" | "worst_case":
+				return max(results, key=lambda x: x.target_score)
+			case "cost_per_value":
+				return min(results, key=lambda x: x.target_score)
+			case _:
+				raise ValueError(f"Unsupported target: {self.target}")
