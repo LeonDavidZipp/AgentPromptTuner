@@ -15,3 +15,6 @@
 # Sensitive files
 **/.env
 **/server
+
+# Other
+**/.vscode

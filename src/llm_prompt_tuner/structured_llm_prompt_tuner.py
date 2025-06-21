@@ -3,7 +3,7 @@ from langchain.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
 from langchain_core.language_models.base import LanguageModelInput
 from typing import Any, Literal, TypeAlias
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from collections import defaultdict
 from enum import IntEnum
 import numpy as np
@@ -71,6 +71,8 @@ class TuneInput(BaseModel):
 	- scenario: the scenario to run the model-prompt-combination against
 	"""
 
+	model_config = ConfigDict(arbitrary_types_allowed=True)
+
 	model: Runnable[LanguageModelInput, dict[str, Any] | BaseModel]
 	prompt: ChatPromptTemplate
 	scenario: Scenario
@@ -95,9 +97,11 @@ class IntermediateTuneResult(BaseModel):
 	- individual_scores: the scores for each individual tuning run, between 0 and 1
 	"""
 
+	model_config = ConfigDict(arbitrary_types_allowed=True)
+
 	model: Runnable[LanguageModelInput, dict[str, Any] | BaseModel]
 	prompt: str
-	individual_scores: NDArray[np.float128]
+	individual_scores: NDArray[np.float16]
 
 
 class TuneResult(BaseModel):
@@ -109,10 +113,12 @@ class TuneResult(BaseModel):
 	- target_score: the overall score of the model-prompt-combination, between 0 and 1 if "median_score", "mean_score", "best_case", "worst_case" or >= 0 if "cost_per_value"
 	"""
 
+	model_config = ConfigDict(arbitrary_types_allowed=True)
+
 	model: Runnable[LanguageModelInput, dict[str, Any] | BaseModel]
 	prompt: str
 	temperature: int | float
-	individual_scores: NDArray[np.float128]
+	individual_scores: NDArray[np.float16]
 	target_score: float
 
 
@@ -401,22 +407,13 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 		output = llm.invoke(formatted_prompt)
 		expected = scenario.expected_output
 
-		if not isinstance(output, expected.__class__):
+		if not isinstance(output, BaseModel) or not isinstance(expected, BaseModel):
 			raise ValueError(
-				f"Output type {type(output)} does not match expected type {type(expected)}"
+				"Output and expected output must be instances of pydantic BaseModel"
 			)
-
-		fields = set(
-			el
-			for el in dir(output)
-			if not el.startswith("__") and not el.endswith("__")
-		)
-		expected_fields = set(
-			el
-			for el in dir(expected)
-			if not el.startswith("__") and not el.endswith("__")
-		)
-		common_fields = fields & expected_fields
+		output_fields = set(output.__class__.model_fields.keys())
+		expected_fields = set(expected.__class__.model_fields.keys())
+		common_fields = output_fields & expected_fields
 
 		correct = sum(
 			getattr(output, field, None) == getattr(expected, field, None)
@@ -454,7 +451,7 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 
 		raise NotImplementedError("unimplemented")
 
-	def calc_target_score_(self, scores: NDArray[np.float128]) -> float:
+	def calc_target_score_(self, scores: NDArray[np.float16]) -> float:
 		"""
 		Calculates the overall score from individual results.
 
@@ -480,12 +477,12 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 				raise ValueError(f"Unsupported target: {self.target}")
 
 	# TODO: implement cost calculation logic, this is a placeholder
-	def calc_cost_per_value_score_(self, scores: NDArray[np.float128]) -> float:
+	def calc_cost_per_value_score_(self, scores: NDArray[np.float16]) -> float:
 		"""
 		Calculates the cost per correct value score from individual results.
 
 		Args:
-			scores (NDArray[np.float128]): Array of individual scores.
+			scores (NDArray[np.float16]): Array of individual scores.
 
 		Returns:
 			float | None: The cost per correct value score, or None if not applicable.
