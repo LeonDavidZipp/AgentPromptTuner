@@ -11,7 +11,10 @@ from numpy.typing import NDArray
 import asyncio
 import itertools
 import warnings
+import logging
+import time
 from .config import SUPPORTED_PROVIDERS
+from ..other import NoOpLogger
 
 
 class TuneOutcome(IntEnum):
@@ -108,6 +111,7 @@ class TuneResult(BaseModel):
 
 	model: Runnable[LanguageModelInput, dict[str, Any] | BaseModel]
 	prompt: str
+	temperature: int | float
 	individual_scores: NDArray[np.float128]
 	target_score: float
 
@@ -125,8 +129,8 @@ CombinationData: TypeAlias = tuple[
 
 
 class BaseLLMPromptTuner:
-	def __init__(self, logs_path: str | None = None):
-		self.logs_path = logs_path
+	def __init__(self, logger_name: str | None = None):
+		self.logger = logging.getLogger(logger_name) if logger_name else NoOpLogger()
 		self.model_providers_ = SUPPORTED_PROVIDERS
 
 
@@ -165,15 +169,24 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 		prompt_improvement_llm: BaseChatModel | None = None,
 		initial_prompt_improvement_prompt: str | None = None,
 		improvement_retries: int | None = None,
-		logs_path: str | None = None,
+		logger_name: str | None = None,
 	):
-		super().__init__(logs_path=logs_path)
+		super().__init__(logger_name)
 		self.target = target
 		self.repeat = repeat
 		self.prompt_improvement_llm = prompt_improvement_llm
 		self.prompt_improvement_prompt = initial_prompt_improvement_prompt
 		self.improvement_retries = improvement_retries
-		# TODO: add logging
+
+		# logging
+		self.logger.info(f"Initializing StructuredLLMPromptTuner")
+		self.logger.info(f"Target metric: {target}, Repetitions: {repeat}")
+		if self.prompt_improvement_llm:
+			self.logger.info(
+				f"Prompt improvement enabled with {self.improvement_retries} retries"
+			)
+		else:
+			self.logger.info("Prompt improvement disabled")
 
 	def find(
 		self,
@@ -195,14 +208,17 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 			list[SingleTuneResult]: List of tuning results, each containing the model, prompt,
 				individual scores, overall score, and optional improvement suggestion.
 		"""
-		raise NotImplementedError("This method is not implemented yet.")
+
+		raise NotImplementedError(
+			f"{self.__class__.__name__}.find is not implemented, use afind instead"
+		)
 
 	async def afind(
 		self,
 		structured_llms: list[Runnable[LanguageModelInput, dict[str, Any] | BaseModel]],
 		prompts: list[str],
-		temperature: int | float | list[int | float],
 		scenarios: list[Scenario],
+		temperature: int | float | list[int | float] = 0,
 	) -> TuneResult:
 		"""
 		Runs scenario asynchronously on structured LLMs with various prompts and expected outputs.
@@ -255,6 +271,16 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 		grouped_tasks: dict[
 			CombinationKey, list[asyncio.Task[IntermediateTuneResult]]
 		] = {}
+
+		self.logger.info("=" * 50)
+		self.logger.info(f"Starting LLM tuning session")
+		self.logger.info(
+			f"Models: {len(structured_llms)}, Prompts: {len(prompts)}, Scenarios: {len(scenarios)}"
+		)
+		self.logger.info(f"Temperature range: {temperature}")
+
+		start_time = time.time()
+
 		async with asyncio.TaskGroup() as tg:
 			for key, combo_list in grouped_combinations.items():
 				tasks_for_combo = [
@@ -282,12 +308,20 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 				TuneResult(
 					model=val[0].model,
 					prompt=key[1],
+					temperature=key[2],
 					individual_scores=individual_scores,
 					target_score=target_score,
 				)
 			)
 
-		return self.find_best_(results)
+		best = self.find_best_(results)
+		self.logger.info(
+			f"Finished LLM tuning session in {time.time() - start_time:.2f} seconds"
+		)
+		self.logger.info(
+			f"Best result: {best.model} with prompt '{best.prompt}' & temperature {best.temperature}"
+		)
+		return best
 
 	async def atune_scenario(
 		self,
@@ -470,6 +504,7 @@ class StructuredLLMPromptTuner(BaseLLMPromptTuner):
 			UserWarning: If the results are empty.
 			ValueError: If the target is unsupported.
 		"""
+
 		if not results:
 			raise ValueError(
 				"No results found. Ensure that the tuning process was successful."
