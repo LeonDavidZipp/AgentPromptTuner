@@ -6,11 +6,12 @@ import unittest
 import warnings
 import asyncio
 import numpy as np
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, Mock, AsyncMock
 from src.llm_prompt_tuner import (
 	StructuredLLMPromptTuner,
 	Scenario,
 	TuneOutcome,
+	TuneResult,
 	IntermediateTuneResult,
 	SingleTuneResult,
 )
@@ -29,8 +30,32 @@ class MockLLM(Runnable[LanguageModelInput, dict[str, Any] | BaseModel]):
 	async def ainvoke(self, input: str, config=None) -> BaseModel:  # type: ignore[override]
 		pass
 
-	def with_config(self, **kwargs):  # type: ignore[override]
+	def with_config(self, **kwargs) -> "MockLLM":  # type: ignore
+		new_mock = MockLLM(self.expected_output)
+		return new_mock
+
+
+class MultiCallMockLLM(Runnable[LanguageModelInput, dict[str, Any] | BaseModel]):
+	def __init__(self, expected_output: list[BaseModel], repeat: int = 1):
+		self.expected_output: list[BaseModel] = expected_output
+		self.count: int = 0
+		self.repeat: int = repeat
+		self.max: int = repeat * len(expected_output)
+
+	def invoke(self, input: str, config=None) -> BaseModel:  # type: ignore[override]
+		# Always return the expected output (perfect score)
+		if self.count >= self.max:
+			raise ValueError(f"Cannot call this more than {self.max} times")
+		res = self.expected_output[int(self.count / self.repeat)]
+		self.count += 1
+		return res
+
+	async def ainvoke(self, input: str, config=None) -> BaseModel:  # type: ignore[override]
 		pass
+
+	def with_config(self, **kwargs) -> "MultiCallMockLLM":  # type: ignore
+		new_mock = MultiCallMockLLM(self.expected_output, self.repeat)
+		return new_mock
 
 
 class FailingMockLLM(Runnable[LanguageModelInput, dict[str, Any] | BaseModel]):
@@ -41,7 +66,7 @@ class FailingMockLLM(Runnable[LanguageModelInput, dict[str, Any] | BaseModel]):
 		pass
 
 	def with_config(self, **kwargs):  # type: ignore[override]
-		pass
+		return FailingMockLLM()
 
 
 class PersonOutput(BaseModel):
@@ -550,6 +575,431 @@ class ATuneScenarioTest(unittest.IsolatedAsyncioTestCase):
 			# Should only include the 3 successful results
 			self.assertEqual(len(result.individual_scores), 3)
 			np.testing.assert_array_equal(result.individual_scores, [1.0, 0.3, 0.9])
+
+
+class AFindTest(unittest.IsolatedAsyncioTestCase):
+	def setUp(self):
+		"""Set up tuner instances and test data"""
+		self.tuner = StructuredLLMPromptTuner(repeat=1)
+		self.tuner_multi = StructuredLLMPromptTuner(repeat=3)
+
+		# Test scenarios
+		self.scenario1 = Scenario(
+			input={"input": "Hannah is 30 years old and weighs 60kg."},
+			expected_output=PersonOutput(name="Hannah", age=30, weight=60.0),
+		)
+		self.scenario2 = Scenario(
+			input={"input": "John is 25 years old and weighs 70kg."},
+			expected_output=PersonOutput(name="John", age=25, weight=70.0),
+		)
+
+		# Test LLMs
+		self.perfect_llm: Runnable[LanguageModelInput, dict[str, Any] | BaseModel] = (
+			MockLLM(PersonOutput(name="Hannah", age=30, weight=60.0))
+		)
+		self.partial_llm: Runnable[LanguageModelInput, dict[str, Any] | BaseModel] = (
+			MockLLM(PersonOutput(name="Hannah", age=25, weight=60.0))
+		)  # age wrong
+		self.zero_llm: Runnable[LanguageModelInput, dict[str, Any] | BaseModel] = (
+			MockLLM(PersonOutput(name="Wrong", age=99, weight=99.0))
+		)  # all wrong
+
+	# Temperature validation tests
+	async def test_temperature_int_conversion(self):
+		"""Test that integer temperature is converted to float"""
+		result = await self.tuner.afind(
+			structured_llms=[self.perfect_llm],
+			prompts=["Extract: {input}"],
+			scenarios=[self.scenario1],
+			temperature=0,  # int
+		)
+
+		self.assertIsInstance(result, TuneResult)
+		self.assertEqual(result.temperature, 0.0)
+
+	async def test_temperature_float_validation(self):
+		"""Test that valid float temperature works"""
+		result = await self.tuner.afind(
+			structured_llms=[self.perfect_llm],
+			prompts=["Extract: {input}"],
+			scenarios=[self.scenario1],
+			temperature=0.5,
+		)
+
+		self.assertEqual(result.temperature, 0.5)
+
+	async def test_temperature_list_validation(self):
+		"""Test that list of temperatures works"""
+		result = await self.tuner.afind(
+			structured_llms=[self.perfect_llm],
+			prompts=["Extract: {input}"],
+			scenarios=[self.scenario1],
+			temperature=[0.0, 0.3, 0.7],
+		)
+
+		# Should return best result from the temperature list
+		self.assertIn(result.temperature, [0.0, 0.3, 0.7])
+
+	async def test_temperature_out_of_range_raises_error(self):
+		"""Test that temperature outside 0-1 range raises ValueError"""
+		with self.assertRaises(ValueError) as context:
+			await self.tuner.afind(
+				structured_llms=[self.perfect_llm],
+				prompts=["Extract: {input}"],
+				scenarios=[self.scenario1],
+				temperature=1.5,  # > 1.0
+			)
+
+		self.assertIn("Temperature must be between 0.0 and 1.0", str(context.exception))
+
+	async def test_temperature_negative_raises_error(self):
+		"""Test that negative temperature raises ValueError"""
+		with self.assertRaises(ValueError) as context:
+			await self.tuner.afind(
+				structured_llms=[self.perfect_llm],
+				prompts=["Extract: {input}"],
+				scenarios=[self.scenario1],
+				temperature=-0.1,
+			)
+
+		self.assertIn("Temperature must be between 0.0 and 1.0", str(context.exception))
+
+	async def test_temperature_list_invalid_values_raises_error(self):
+		"""Test that list with invalid temperature values raises ValueError"""
+		with self.assertRaises(ValueError) as context:
+			await self.tuner.afind(
+				structured_llms=[self.perfect_llm],
+				prompts=["Extract: {input}"],
+				scenarios=[self.scenario1],
+				temperature=[0.0, 0.5, 1.5],  # 1.5 > 1.0
+			)
+
+		self.assertIn(
+			"All temperatures must be between 0.0 and 1.0", str(context.exception)
+		)
+
+	async def test_temperature_wrong_type_raises_error(self):
+		"""Test that invalid temperature type raises TypeError"""
+		with self.assertRaises(TypeError) as context:
+			await self.tuner.afind(
+				structured_llms=[self.perfect_llm],
+				prompts=["Extract: {input}"],
+				scenarios=[self.scenario1],
+				temperature="invalid",  # type: ignore
+			)
+
+		self.assertIn(
+			"Temperature must be a float, int, or list", str(context.exception)
+		)
+
+	# Basic functionality tests
+	async def test_single_combination_perfect_score(self):
+		"""Test single model, prompt, scenario combination with perfect score"""
+		result = await self.tuner.afind(
+			structured_llms=[self.perfect_llm],
+			prompts=["Extract person data: {input}"],
+			scenarios=[self.scenario1],
+			temperature=0.0,
+		)
+
+		self.assertIsInstance(result, TuneResult)
+		self.assertEqual(result.target_score, 1.0)
+		self.assertEqual(result.temperature, 0.0)
+		self.assertEqual(result.prompt, "Extract person data: {input}")
+		self.assertIs(result.model, self.perfect_llm)
+
+	async def test_multiple_scenarios_aggregation(self):
+		"""Test that multiple scenarios are properly aggregated"""
+		# Both scenarios should get perfect scores
+		perfect_llm_multi = MockLLM(PersonOutput(name="Perfect", age=99, weight=99.0))
+
+		result = await self.tuner.afind(
+			structured_llms=[perfect_llm_multi],
+			prompts=["Extract: {input}"],
+			scenarios=[self.scenario1, self.scenario2],
+			temperature=0.0,
+		)
+
+		# Should have scores from both scenarios
+		self.assertEqual(len(result.individual_scores), 2)
+
+	async def test_multiple_models_comparison(self):
+		"""Test that multiple models are compared and best is returned"""
+		models = [self.perfect_llm, self.partial_llm, self.zero_llm]
+
+		result = await self.tuner.afind(
+			structured_llms=models,
+			prompts=["Extract: {input}"],
+			scenarios=[self.scenario1],
+			temperature=0.0,
+		)
+
+		# Should return the perfect LLM as best
+		self.assertEqual(result.target_score, 1.0)
+		self.assertIs(result.model, self.perfect_llm)
+
+	async def test_multiple_prompts_comparison(self):
+		"""Test that multiple prompts are compared"""
+		prompts = [
+			"Extract person data: {input}",
+			"Find person info: {input}",
+			"Parse person details: {input}",
+		]
+
+		result = await self.tuner.afind(
+			structured_llms=[self.perfect_llm],
+			prompts=prompts,
+			scenarios=[self.scenario1],
+			temperature=0.0,
+		)
+
+		# Should return one of the prompts (all should perform equally with perfect LLM)
+		self.assertIn(result.prompt, prompts)
+		self.assertEqual(result.target_score, 1.0)
+
+	async def test_multiple_temperatures_comparison(self):
+		"""Test that multiple temperatures are compared"""
+		temperatures = [0.0, 0.3, 0.7]
+
+		result = await self.tuner.afind(
+			structured_llms=[self.perfect_llm],
+			prompts=["Extract: {input}"],
+			scenarios=[self.scenario1],
+			temperature=temperatures,
+		)
+
+		# Should return one of the temperatures
+		self.assertIn(result.temperature, temperatures)
+
+	async def test_combination_explosion_handling(self):
+		"""Test handling of many combinations (2 models × 3 prompts × 2 temps × 2 scenarios = 24 combinations)"""
+		models = [self.perfect_llm, self.partial_llm]
+		prompts = ["Prompt 1: {input}", "Prompt 2: {input}", "Prompt 3: {input}"]
+		temperatures = [0.0, 0.5]
+		scenarios = [self.scenario1, self.scenario2]
+
+		result = await self.tuner.afind(
+			structured_llms=models,
+			prompts=prompts,
+			scenarios=scenarios,
+			temperature=temperatures,
+		)
+
+		# Should complete successfully and return best result
+		self.assertIsInstance(result, TuneResult)
+		self.assertIn(result.model, models)
+		self.assertIn(result.prompt, prompts)
+		self.assertIn(result.temperature, temperatures)
+
+	# Error handling tests
+	async def test_all_combinations_fail_raises_error(self):
+		"""Test that ValueError is raised when all combinations fail"""
+		failing_llm = FailingMockLLM()
+
+		with self.assertRaises(ExceptionGroup):  # TaskGroup wraps exceptions
+			await self.tuner.afind(
+				structured_llms=[failing_llm],
+				prompts=["Extract: {input}"],
+				scenarios=[self.scenario1],
+				temperature=0.0,
+			)
+
+	async def test_no_successful_runs_raises_error(self):
+		"""Test error when all runs have zero fields (no common fields)"""
+		different_output_llm = MockLLM(
+			DifferentOutput(title="Test", description="Desc")
+		)
+
+		with self.assertRaises(ExceptionGroup) as context:
+			await self.tuner.afind(
+				structured_llms=[different_output_llm],
+				prompts=["Extract: {input}"],
+				scenarios=[self.scenario1],
+				temperature=0.0,
+			)
+
+		# Verify the ExceptionGroup contains the expected ValueError
+		exception_group = context.exception
+		self.assertEqual(len(exception_group.exceptions), 1)
+
+		inner_exception = exception_group.exceptions[0]
+		self.assertIsInstance(inner_exception, ValueError)
+		self.assertIn("No successful tuning runs found", str(inner_exception))
+
+	# Result structure tests
+	async def test_result_structure_completeness(self):
+		"""Test that TuneResult contains all expected fields"""
+		result = await self.tuner.afind(
+			structured_llms=[self.perfect_llm],
+			prompts=["Extract: {input}"],
+			scenarios=[self.scenario1],
+			temperature=0.0,
+		)
+
+		# Check all required fields are present
+		self.assertIsNotNone(result.model)
+		self.assertIsNotNone(result.prompt)
+		self.assertIsNotNone(result.temperature)
+		self.assertIsNotNone(result.individual_scores)
+		self.assertIsNotNone(result.target_score)
+
+		# Check types
+		self.assertIsInstance(result.individual_scores, np.ndarray)
+		self.assertIsInstance(result.target_score, float)
+
+	async def test_individual_scores_aggregation(self):
+		"""Test that individual scores are properly aggregated across scenarios"""
+		llm = MultiCallMockLLM(
+			[self.scenario1.expected_output, self.scenario2.expected_output], 3
+		)
+		result = await self.tuner_multi.afind(  # repeat=3
+			structured_llms=[llm],
+			prompts=["Extract: {input}"],
+			scenarios=[self.scenario1, self.scenario2],  # 2 scenarios
+			temperature=0.0,
+		)
+
+		# Should have 3 repeats × 2 scenarios = 6 scores
+		self.assertEqual(len(result.individual_scores), 6)
+		# All should be perfect scores
+		np.testing.assert_array_equal(result.individual_scores, np.ones(6))
+
+	# Concurrency and performance tests
+	async def test_concurrent_execution(self):
+		"""Test that combinations are executed concurrently"""
+		import time
+
+		# Use a slow mock to test concurrency
+		class SlowMockLLM(MockLLM):
+			def invoke(self, input, config=None):  # type: ignore
+				import time
+
+				time.sleep(0.1)  # Simulate slow LLM
+				return self.expected_output
+
+		slow_llm = SlowMockLLM(PersonOutput(name="Hannah", age=30, weight=60.0))
+
+		start_time = time.time()
+
+		await self.tuner.afind(
+			structured_llms=[slow_llm, slow_llm],  # 2 models
+			prompts=["Prompt 1: {input}", "Prompt 2: {input}"],  # 2 prompts
+			scenarios=[self.scenario1],
+			temperature=[0.0, 0.5],  # 2 temperatures
+		)
+
+		elapsed_time = time.time() - start_time
+
+		# Should take ~0.1s (concurrent) not ~0.8s (sequential for 8 combinations)
+		self.assertLess(elapsed_time, 0.5)
+
+	# with_config method testing
+	async def test_temperature_with_config_called(self):
+		"""Test that with_config is called with temperature when temperature > 0"""
+		mock_llm = Mock(spec=MockLLM)
+		mock_llm.with_config.return_value = self.perfect_llm
+		mock_configured_llm = mock_llm.with_config.return_value
+
+		with patch.object(
+			self.tuner,
+			"atune_scenario",
+			return_value=IntermediateTuneResult(
+				model=mock_configured_llm,
+				prompt="test",
+				individual_scores=np.array([1.0]),
+			),
+		) as _:
+			await self.tuner.afind(
+				structured_llms=[mock_llm],
+				prompts=["Extract: {input}"],
+				scenarios=[self.scenario1],
+				temperature=0.5,
+			)
+
+			# Verify with_config was called with temperature
+			mock_llm.with_config.assert_called_with(temperature=0.5)
+
+	async def test_no_with_config_when_temp_zero(self):
+		"""Test that with_config is not called when temperature is 0"""
+		mock_llm = Mock(spec=MockLLM)
+
+		with patch.object(
+			self.tuner,
+			"atune_scenario",
+			return_value=IntermediateTuneResult(
+				model=mock_llm, prompt="test", individual_scores=np.array([1.0])
+			),
+		) as _:
+			await self.tuner.afind(
+				structured_llms=[mock_llm],
+				prompts=["Extract: {input}"],
+				scenarios=[self.scenario1],
+				temperature=0.0,
+			)
+
+			# Verify with_config was not called
+			mock_llm.with_config.assert_not_called()
+
+	# Logging tests
+	async def test_logging_output(self):
+		"""Test that appropriate logging occurs"""
+		with patch.object(self.tuner, "logger") as mock_logger:
+			await self.tuner.afind(
+				structured_llms=[self.perfect_llm],
+				prompts=["Extract: {input}"],
+				scenarios=[self.scenario1],
+				temperature=0.0,
+			)
+
+			# Check that logging calls were made
+			self.assertGreater(mock_logger.info.call_count, 0)
+
+			# Check specific log messages
+			log_calls = [call[0][0] for call in mock_logger.info.call_args_list]
+			self.assertTrue(
+				any("Starting LLM tuning session" in call for call in log_calls)
+			)
+			self.assertTrue(
+				any("Finished LLM tuning session" in call for call in log_calls)
+			)
+
+	# Edge cases
+	async def test_empty_lists_raises_error(self):
+		"""Test behavior with empty input lists"""
+		# This should fail during iteration - empty combinations
+		with self.assertRaises(Exception):
+			await self.tuner.afind(
+				structured_llms=[],  # Empty
+				prompts=["Extract: {input}"],
+				scenarios=[self.scenario1],
+				temperature=0.0,
+			)
+
+	async def test_best_selection_logic(self):
+		"""Test that the correct 'best' result is selected"""
+		# Create LLMs with different performance levels
+		excellent_llm = MockLLM(
+			PersonOutput(name="Hannah", age=30, weight=60.0)
+		)  # 3/3 = 1.0
+		good_llm = MockLLM(
+			PersonOutput(name="Hannah", age=25, weight=60.0)
+		)  # 2/3 = 0.67
+		poor_llm = MockLLM(PersonOutput(name="Wrong", age=99, weight=99.0))  # 0/3 = 0.0
+
+		result = await self.tuner.afind(
+			structured_llms=[
+				poor_llm,
+				good_llm,
+				excellent_llm,
+			],  # Order shouldn't matter
+			prompts=["Extract: {input}"],
+			scenarios=[self.scenario1],
+			temperature=0.0,
+		)
+
+		# Should select the excellent LLM
+		self.assertEqual(result.target_score, 1.0)
+		self.assertIs(result.model, excellent_llm)
 
 
 if __name__ == "__main__":
